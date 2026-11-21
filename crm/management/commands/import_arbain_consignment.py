@@ -127,46 +127,52 @@ class Command(BaseCommand):
                 visits[customer, max(days)].append((row, product, days, opening, added, returned, sold, closing))
 
         label = f'laporan setor {MONTHS[month.month - 1]} {month.year}'
-        entries, last_visit = 0, {}
+        activities, last_visit = [], {}
         for (customer, day), lines in visits.items():
             sold_total = sum(line[6] for line in lines)
             summary = (f'Cek titip jual {len(lines)} produk: laku {sold_total}, ditarik {sum(line[5] for line in lines)}, '
                        f'titip baru {sum(line[4] for line in lines)}, stok akhir di outlet {sum(line[7] for line in lines)}.')
-            done_at = timezone.make_aware(datetime.combine(day, time(12)))
-            activity = Activity.objects.create(
-                customer=customer, sales=customer.owner, kind=Activity.Kind.VISIT,
+            activities.append(Activity(
+                customer=customer, sales_id=customer.owner_id, kind=Activity.Kind.VISIT,
                 stage=Activity.Stage.WON if sold_total else Activity.Stage.INTERESTED,
                 scheduled_date=day, status=Activity.Status.DONE, note=f'Kunjungan titip jual ({label})',
-                result=summary, completed_at=done_at)
-            Activity.objects.filter(pk=activity.pk).update(created_at=done_at)
+                result=summary, completed_at=timezone.make_aware(datetime.combine(day, time(12)))))
+            last_visit[customer] = max(day, last_visit.get(customer, day))
+        Activity.objects.bulk_create(activities, batch_size=500)
+        for activity in activities:
+            activity.created_at = activity.completed_at
+        Activity.objects.bulk_update(activities, ['created_at'], batch_size=500)
+
+        entries, balances = [], []
+        for activity, ((customer, day), lines) in zip(activities, visits.items()):
             for row, product, days, opening, added, returned, sold, closing in lines:
                 source = f'Sumber: {label}, {row.region}, hal. {row.page}.'
                 if len(days) > 1:
                     source += ' Gabungan setor ' + ', '.join(d.strftime('%d/%m/%Y') for d in days) + '.'
-                ConsignmentVisitEntry.objects.create(
-                    customer=customer, product=product, sales=customer.owner, activity=activity, visit_date=day,
+                entries.append(ConsignmentVisitEntry(
+                    customer=customer, product=product, sales_id=customer.owner_id, activity=activity, visit_date=day,
                     previous_stock=opening, sold_quantity=sold, remaining_stock=opening - sold, added_quantity=added,
                     returned_quantity=returned, closing_stock=closing,
                     billing_status=ConsignmentVisitEntry.BillingStatus.NOT_BILLED,
                     gross_rupiah=sold * (product.price_rupiah or 0), discount_percent=customer.discount_percent or 0,
-                    net_billed_rupiah=0, physical_stamp_verified=False, note=source)
-                ConsignmentStock.objects.create(
+                    net_billed_rupiah=0, physical_stamp_verified=False, note=source))
+                balances.append(ConsignmentStock(
                     customer=customer, product=product, quantity_on_display=closing, total_placed=opening + added,
-                    total_sold=sold, total_returned=returned, last_checked_date=day)
-                entries += 1
-            last_visit[customer] = max(day, last_visit.get(customer, day))
+                    total_sold=sold, total_returned=returned, last_checked_date=day))
+        ConsignmentVisitEntry.objects.bulk_create(entries, batch_size=500)
+        ConsignmentStock.objects.bulk_create(balances, batch_size=500)
+        entries = len(entries)
 
         scheduled = 0
         if schedule_next:
             planned = set(Activity.objects.filter(status=Activity.Status.PLANNED, customer__in=[c.pk for c in last_visit])
                           .values_list('customer_id', flat=True))
-            for customer, day in last_visit.items():
-                if customer.pk not in planned:
-                    Activity.objects.create(
-                        customer=customer, sales=customer.owner, kind=Activity.Kind.VISIT, stage=Activity.Stage.INTERESTED,
-                        scheduled_date=month_later(day), status=Activity.Status.PLANNED,
-                        note='Kunjungan rutin bulanan titip jual')
-                    scheduled += 1
+            upcoming = [Activity(
+                customer=customer, sales_id=customer.owner_id, kind=Activity.Kind.VISIT, stage=Activity.Stage.INTERESTED,
+                scheduled_date=month_later(day), status=Activity.Status.PLANNED, note='Kunjungan rutin bulanan titip jual')
+                for customer, day in last_visit.items() if customer.pk not in planned]
+            Activity.objects.bulk_create(upcoming, batch_size=500)
+            scheduled = len(upcoming)
 
         if not apply:
             transaction.set_rollback(True)
